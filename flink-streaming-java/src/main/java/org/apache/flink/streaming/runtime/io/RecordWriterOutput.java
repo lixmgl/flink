@@ -32,7 +32,6 @@ import org.apache.flink.streaming.runtime.streamrecord.StreamElement;
 import org.apache.flink.streaming.runtime.streamrecord.StreamElementSerializer;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import org.apache.flink.streaming.runtime.streamstatus.StreamStatus;
-import org.apache.flink.streaming.runtime.streamstatus.StreamStatusProvider;
 import org.apache.flink.streaming.runtime.tasks.WatermarkGaugeExposingOutput;
 import org.apache.flink.util.OutputTag;
 
@@ -48,8 +47,6 @@ public class RecordWriterOutput<OUT> implements WatermarkGaugeExposingOutput<Str
 
     private SerializationDelegate<StreamElement> serializationDelegate;
 
-    private final StreamStatusProvider streamStatusProvider;
-
     private final boolean supportsUnalignedCheckpoints;
 
     private final OutputTag outputTag;
@@ -63,7 +60,6 @@ public class RecordWriterOutput<OUT> implements WatermarkGaugeExposingOutput<Str
             RecordWriter<SerializationDelegate<StreamRecord<OUT>>> recordWriter,
             TypeSerializer<OUT> outSerializer,
             OutputTag outputTag,
-            StreamStatusProvider streamStatusProvider,
             boolean supportsUnalignedCheckpoints) {
 
         checkNotNull(recordWriter);
@@ -79,8 +75,6 @@ public class RecordWriterOutput<OUT> implements WatermarkGaugeExposingOutput<Str
         if (outSerializer != null) {
             serializationDelegate = new SerializationDelegate<StreamElement>(outRecordSerializer);
         }
-
-        this.streamStatusProvider = checkNotNull(streamStatusProvider);
 
         this.supportsUnalignedCheckpoints = supportsUnalignedCheckpoints;
     }
@@ -103,6 +97,9 @@ public class RecordWriterOutput<OUT> implements WatermarkGaugeExposingOutput<Str
     }
 
     private <X> void pushToRecordWriter(StreamRecord<X> record) {
+        // StreamStatus.IDLE requires that no records nor watermarks travel through the branch
+        // in order to keep the older behaviour that records could've been generated down the
+        // pipeline even though the sources were idle we go through a short ACTIVE/IDLE loop
         if (announcedStatus.isIdle()) {
             writeStreamStatus(StreamStatus.ACTIVE);
         }
@@ -121,14 +118,23 @@ public class RecordWriterOutput<OUT> implements WatermarkGaugeExposingOutput<Str
 
     @Override
     public void emitWatermark(Watermark mark) {
+        // StreamStatus.IDLE requires that no records nor watermarks travel through the branch
+        // in order to keep the older behaviour that records could've been generated down the
+        // pipeline even though the sources were idle we go through a short ACTIVE/IDLE loop
+        if (announcedStatus.isIdle()) {
+            writeStreamStatus(StreamStatus.ACTIVE);
+        }
+
         watermarkGauge.setCurrentWatermark(mark.getTimestamp());
         serializationDelegate.setInstance(mark);
-        if (streamStatusProvider.getStreamStatus().isActive()) {
-            try {
-                recordWriter.broadcastEmit(serializationDelegate);
-            } catch (Exception e) {
-                throw new RuntimeException(e.getMessage(), e);
-            }
+        try {
+            recordWriter.broadcastEmit(serializationDelegate);
+        } catch (Exception e) {
+            throw new RuntimeException(e.getMessage(), e);
+        }
+
+        if (announcedStatus.isIdle()) {
+            writeStreamStatus(StreamStatus.IDLE);
         }
     }
 
